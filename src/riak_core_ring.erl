@@ -35,7 +35,7 @@
 	 index_owner/2,diff_nodes/2,random_node/1, random_other_node/1, random_other_index/1,
          random_other_index/2,
          all_preflists/2,
-         get_meta/2, update_meta/3, equal_rings/2]).	 
+         get_meta/2, get_meta/1, update_meta/3, equal_rings/2, get_vclock/1]).	 
 
 -export_type([riak_core_ring/0]).
 
@@ -77,6 +77,11 @@ fresh(RingSize, NodeName) ->
 	    vclock=vclock:fresh(),
 	    chring=chash:fresh(RingSize, NodeName),
             meta=dict:new()}.
+
+get_vclock(#chstate{vclock=VClock}) -> VClock.
+
+get_meta(#chstate{meta=Meta}) -> Meta.
+    
 
 % @doc Return all partition indices owned by the node executing this function.
 -spec my_indices(State :: chstate()) -> [integer()].

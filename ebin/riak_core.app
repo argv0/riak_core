@@ -46,6 +46,8 @@
              riak_core_vnode_master,
              riak_core_vnode_sup,
              riak_core_web,
+             riak_core_wm_api,
+             riak_core_wm_api_util,
              riak_core_wm_urlmap,
              slide,
              spiraltime,
