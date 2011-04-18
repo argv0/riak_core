@@ -24,6 +24,9 @@
 -export([register_vnode_module/1, vnode_modules/0]).
 -export([add_guarded_event_handler/3, add_guarded_event_handler/4]).
 -export([delete_guarded_event_handler/3]).
+-export([get_ring/0, ring_trans/2, service_up/2, service_down/1,
+         node_up/0, node_down/0, services/0, services/1,
+         nodes/1]).
 
 %% @spec stop() -> ok
 %% @doc Stop the riak application and the calling process.
@@ -42,6 +45,33 @@ stop(Reason) ->
     error_logger:info_msg(io_lib:format("~p~n",[Reason])),
     init:stop().
 -endif.
+
+get_ring() ->
+    riak_core_ring_manager:get_my_ring().
+
+ring_trans(Fun, Args) ->
+    riak_core_ring_manager:ring_trans(Fun, Args).
+
+service_up(Id, Pid) ->
+    riak_core_node_watcher:service_up(Id, Pid).
+
+service_down(Id) ->
+    riak_core_node_watcher:service_down(Id).
+
+node_up() ->
+    riak_core_node_watcher:node_up().
+
+node_down() ->
+    riak_core_node_watcher:node_down().
+
+services() ->
+    riak_core_node_watcher:services().
+
+services(Node) ->
+    riak_core_node_watcher:services(Node).
+
+nodes(Service) ->
+    riak_core_node_watcher:nodes(Service).
 
 %%
 %% @doc Join the ring found on the specified remote node
