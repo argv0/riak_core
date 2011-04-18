@@ -27,7 +27,7 @@
 -export([get_ring/0, ring_trans/2, service_up/2, service_down/1,
          node_up/0, node_down/0, services/0, services/1,
          nodes/1]).
-
+-export([start_plugin/1]).
 %% @spec stop() -> ok
 %% @doc Stop the riak application and the calling process.
 stop() -> stop("riak stop requested").
@@ -100,6 +100,29 @@ join(Node) when is_atom(Node) ->
 %%      by other nodes.
 remove_from_cluster(ExitingNode) ->
     rpc:call(node(), riak_core_gossip, remove_from_cluster,[ExitingNode]).
+
+start_plugin(AppName) ->
+    SupName = list_to_atom(atom_to_list(AppName) ++ "_sup"),
+    {ok, {AppMod, _}} = application:get_key(AppName, mod),
+    Procs = [vnode_master_spec(V) || V <- AppMod:riak_core_config(vnode_modules)],
+    case SupName:start_link(Procs) of
+        {ok, Pid} ->
+            [register_vnode_module(V) || V <- AppMod:riak_core_config(vnode_modules)],
+            [riak_core_ring_events:add_guarded_handler(H, []) || 
+                H <- AppMod:riak_core_config(ring_handlers)],
+            [riak_core_node_watcher_events:add_guarded_handler(H, [])|| 
+                H <- AppMod:riak_core_config(node_handlers)],
+            ok = riak_core_node_watcher:service_up(AppName, self()),
+            {ok, Pid};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+                
+vnode_master_spec(VNodeMod) ->                
+    { {vnode_master, VNodeMod},
+      {riak_core_vnode_master, start_link, [VNodeMod]},
+      permanent, 5000, worker, [riak_core_vnode_master]}.
+
 
 vnode_modules() ->
     case application:get_env(riak_core, vnode_modules) of

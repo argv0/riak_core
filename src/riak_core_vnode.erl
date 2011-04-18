@@ -92,6 +92,12 @@ start_vnode(Index, VNodeMod) ->
 get_vnode_pid(Index, VNodeMod) ->
     gen_server:call(VNodeMod, {Index, get_vnode}, infinity).
 
+%cmd({VNodeMod, []}, Sender, Msg) ->
+%    ok;
+%cmd({VNodeMod, [{Index,Node}|Rest]},Sender, Msg) ->
+%    gen_server:cast({VNodeMod, Node}, make_request(Msg,Sender,Index)),
+%    command({VNodeMod, Rest}, Sender, Msg).
+
 command(Preflist, Msg, VNodeMod) ->
     command(Preflist, Msg, ignore, VNodeMod).
 
