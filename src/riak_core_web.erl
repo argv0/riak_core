@@ -100,6 +100,8 @@ common_config() ->
     {backlog, 128},
     {dispatch, 
      [{[], riak_core_wm_urlmap, []},
-      {["core"], riak_core_wm_api, []}]}
+      {["core"], riak_core_wm_api, []},
+      {["core", itemtype], riak_core_wm_api, []},
+      {["core", itemtype, item], riak_core_wm_api, []}]}
    ].
      

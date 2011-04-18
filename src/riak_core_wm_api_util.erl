@@ -20,7 +20,7 @@
 %%
 %% -------------------------------------------------------------------
 -module(riak_core_wm_api_util).
--export([ring_to_json/0, ring_to_json/1]).
+-export([ring_to_json/0, ring_to_json/1, status_to_json/0, vnode_module_status_to_json/1]).
 
 ring_to_json() ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
@@ -36,8 +36,34 @@ ring_to_json(Ring) ->
       {meta, meta_to_json(riak_core_ring:get_meta(Ring))}
      ]}.
 
+status_to_json() ->
+    [
+      {connected_nodes, [node()|nodes()]},
+      {running_apps, sets:to_list(sets:from_list([A || {A,_M} <- riak_core:vnode_modules()]))},
+      {vnode_modules, vnode_modules_to_json(riak_core:vnode_modules(), [])}
+    ].
+
+vnode_module_status_to_json(VNodeMod) ->
+    {ok, R} = riak_core_ring_manager:get_my_ring(),
+    AllPids = riak_core_vnode_master:all_nodes(VNodeMod),
+    Indexes = [element(2, riak_core_vnode:get_mod_index(P)) || P <- AllPids],
+    Exclusions = element(2, riak_core_handoff_manager:get_exclusions(VNodeMod)),
+    {struct, 
+      [{list_to_binary(integer_to_list(I)), 
+        {struct, 
+         [
+          {fallback, riak_core_ring:index_owner(R, I) /= node()},
+          {handed_off, lists:member(I, Exclusions)}
+         ]}}
+       || I <- Indexes]}.
+
 meta_to_json(_Meta) ->
     {struct, []}.
+
+vnode_modules_to_json([], Acc) ->
+    sets:to_list(sets:from_list(Acc));
+vnode_modules_to_json([{_App, Mod}|T], Acc) ->
+    vnode_modules_to_json(T, [Mod|Acc]).
 
 vclock_to_json(VClock) ->
     vclock_to_json(vclock:all_nodes(VClock), VClock, []).

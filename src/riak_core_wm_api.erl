@@ -19,23 +19,6 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
-
-%% @doc This module provides a Webmachine resource that lists the
-%%      URLs for other resources available on this host.
-%%
-%%      Links to Riak resources will be added to the Link header in
-%%      the form:
-%%```
-%%         <URL>; rel="RESOURCE_NAME"
-%%'''
-%%      HTML output of this resource is a list of link tags like:
-%%```
-%%         <a href="URL">RESOURCE_NAME</a>
-%%'''
-%%      JSON output of this resource in an object with elements like:
-%%```
-%%         "RESOURCE_NAME":"URL"
-%%'''
 -module(riak_core_wm_api).
 -export([
          init/1,
@@ -45,22 +28,39 @@
          to_json/2
         ]).
 
--record(state, {}).
+-record(state, {type, item, master_name, boundary}).
 -include_lib("webmachine/include/webmachine.hrl").
 
 init([]) ->
     {ok, #state{}}.
 
 resource_exists(RD, State) ->
-    {true, RD, State}.
+    Type = wrq:path_info(itemtype, RD),
+    Item = wrq:path_info(item, RD),
+    resource_exists({Type, Item}, RD, State#state{type=Type, item=Item}).
 
-%add_link_header(RD, State) ->
-%    wrq:set_resp_header(
-%      "Link",
-%      string:join([ ["<",Uri,">; rel=\"",Resource,"\""]
-%                    || {Resource, Uri} <- State ],
-%                  ","),
-%      RD).
+resource_exists({"ring",_}, RD, State) ->
+    {true, RD, State};
+resource_exists({"status",_}, RD, State) ->
+    {true, RD, State};
+resource_exists({"events",_}, RD, State) ->
+    {true, RD, State};
+resource_exists({"vnode",VNodeMod}, RD, State) ->
+    try 
+        MasterName = list_to_existing_atom(VNodeMod ++ "_master"),
+        case whereis(MasterName) of
+            undefined ->
+                {false, RD, State};
+            _ ->
+                {true, RD, State#state{master_name=MasterName}}
+        end
+    catch error:badarg ->
+            {false, RD, State}
+    end;
+resource_exists({undefined,_}, RD, State) ->
+    {true, RD, State};
+resource_exists(_, RD, State) ->
+    {false, RD, State}.
 
 content_types_provided(RD, State) ->
 %%    {[{"text/html", to_html},{"application/json", to_json}], RD, State}.
@@ -73,7 +73,63 @@ content_types_provided(RD, State) ->
 %      "</ul></body></html>"],
 %     RD, State}.
 
-to_json(RD, State) ->
-    {json_pp:print(mochijson2:encode({struct, [{ring, riak_core_wm_api_util:ring_to_json()}]})),
-     RD, State}.
+to_json(RD, State=#state{type="events"}) ->
+    Self = self(),
+    RingFn = fun(R) ->
+                     Self ! {ring_update, R}
+             end,
+    riak_core_ring_events:add_callback(RingFn),
+    NodeFn = fun(S) ->
+                     Self ! {service_update, S}
+             end,
+    riak_core_node_watcher_events:add_callback(NodeFn),
+    Boundary = riak_core_util:unique_id_62(),
+    RD1 = wrq:set_resp_header("Content-Type", "multipart/mixed;boundary=" ++ Boundary, RD),
+    State1 = State#state{boundary=Boundary},
+    {true, wrq:set_resp_body({stream, stream_events(RD1, State1)}, RD1), State1};
+to_json(RD, State=#state{type=Type, item=Item}) ->
+    JSON = mochijson2:encode(get_json({Type, Item}, State)),
+    Body = case wrq:get_qs_value("pretty", "false", RD) of
+        "true" -> json_pp:print(JSON);
+        _ -> JSON
+    end,
+    {Body, RD, State}.
 
+
+get_json({"ring", undefined}, #state{}) ->
+    {struct, [{ring, riak_core_wm_api_util:ring_to_json()}]};
+get_json({"ring", "status"}, #state{}) ->
+    {struct, [{ready, true}]};
+get_json({"status", _}, #state{}) ->
+    {struct, riak_core_wm_api_util:status_to_json()};
+get_json({"vnode", Item}, #state{}) ->
+    riak_core_wm_api_util:vnode_module_status_to_json(list_to_existing_atom(Item)).
+
+stream_events(RD, #state{boundary=Boundary}=State) ->
+    receive
+        {ring_update, R} ->
+            {iolist_to_binary(["\r\n--", Boundary, "\r\n",
+                               "Content-Type: application/json\r\n\r\n",
+                               mochijson2:encode({struct, 
+                                                  [{ring,
+                                                    riak_core_wm_api_util:ring_to_json(R)}]})]),
+             fun() -> stream_events(RD, State) end};
+        {service_update, S} ->
+            {iolist_to_binary(["\r\n--", Boundary, "\r\n",
+                               "Content-Type: application/json\r\n\r\n",
+                               mochijson2:encode(S)]),
+             fun() -> stream_events(RD, State) end}
+    end.
+                     
+%            Data = mochijson2:encode({struct, [{phase, PhaseId}, {data, Res}]}),
+%            Body = ["\r\n--", State#state.boundary, "\r\n",
+%                    "Content-Type: application/json\r\n\r\n",
+%                    Data],
+%            {iolist_to_binary(Body), fun() -> stream_mapred_results(RD, ReqId, State) end}
+
+
+
+%            Body = ["\r\n--", State#state.boundary, "\r\n",
+%                    "Content-Type: application/json\r\n\r\n",
+%                    Data],
+%            {iolist_to_binary(Body), fun() -> stream_mapred_results(RD, ReqId, State) end}
