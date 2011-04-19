@@ -24,7 +24,6 @@
          init/1,
          resource_exists/2,
          content_types_provided/2,
-%%         to_html/2,
          to_json/2
         ]).
 
@@ -63,15 +62,7 @@ resource_exists(_, RD, State) ->
     {false, RD, State}.
 
 content_types_provided(RD, State) ->
-%%    {[{"text/html", to_html},{"application/json", to_json}], RD, State}.
     {[{"application/json", to_json}], RD, State}.
-
-%to_html(RD, State) ->
-%    {["<html><body><ul>",
-%      [ ["<li><a href=\"", Uri, "\">", Resource, "</a></li>"]
-%        || {Resource, Uri} <- State ],
-%      "</ul></body></html>"],
-%     RD, State}.
 
 to_json(RD, State=#state{type="events"}) ->
     Self = self(),
@@ -84,7 +75,7 @@ to_json(RD, State=#state{type="events"}) ->
              end,
     riak_core_node_watcher_events:add_callback(NodeFn),
     Boundary = riak_core_util:unique_id_62(),
-    RD1 = wrq:set_resp_header("Content-Type", "multipart/mixed;boundary=" ++ Boundary, RD),
+    RD1 = wrq:set_response_code(200, wrq:set_resp_header("Content-Type", "multipart/mixed;boundary=" ++ Boundary, RD)),
     State1 = State#state{boundary=Boundary},
     {true, wrq:set_resp_body({stream, stream_events(RD1, State1)}, RD1), State1};
 to_json(RD, State=#state{type=Type, item=Item}) ->
@@ -93,7 +84,7 @@ to_json(RD, State=#state{type=Type, item=Item}) ->
         "true" -> json_pp:print(JSON);
         _ -> JSON
     end,
-    {Body, RD, State}.
+    {Body, wrq:set_response_code(200, RD), State}.
 
 
 get_json({"ring", undefined}, #state{}) ->
@@ -114,22 +105,13 @@ stream_events(RD, #state{boundary=Boundary}=State) ->
                                                   [{ring,
                                                     riak_core_wm_api_util:ring_to_json(R)}]})]),
              fun() -> stream_events(RD, State) end};
-        {service_update, S} ->
+        {service_update, _S} ->
+            %J = [[N, riak_core_node_watcher:services(N)] ||
+            %        N <- riak_core_node_watcher:nodes()],
+            %io:format("~p~n", [J]),
             {iolist_to_binary(["\r\n--", Boundary, "\r\n",
                                "Content-Type: application/json\r\n\r\n",
-                               mochijson2:encode(S)]),
+                               mochijson2:encode(_S)]),
              fun() -> stream_events(RD, State) end}
     end.
                      
-%            Data = mochijson2:encode({struct, [{phase, PhaseId}, {data, Res}]}),
-%            Body = ["\r\n--", State#state.boundary, "\r\n",
-%                    "Content-Type: application/json\r\n\r\n",
-%                    Data],
-%            {iolist_to_binary(Body), fun() -> stream_mapred_results(RD, ReqId, State) end}
-
-
-
-%            Body = ["\r\n--", State#state.boundary, "\r\n",
-%                    "Content-Type: application/json\r\n\r\n",
-%                    Data],
-%            {iolist_to_binary(Body), fun() -> stream_mapred_results(RD, ReqId, State) end}
