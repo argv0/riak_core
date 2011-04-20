@@ -35,7 +35,9 @@
 	 index_owner/2,diff_nodes/2,random_node/1, random_other_node/1, random_other_index/1,
          random_other_index/2,
          all_preflists/2,
-         get_meta/2, update_meta/3, equal_rings/2]).	 
+         get_meta/2, update_meta/3, equal_rings/2,
+         get_node_meta/1, update_node_meta/2,
+         membership_hash/1]).	 
 
 -export_type([riak_core_ring/0]).
 
@@ -44,6 +46,7 @@
     nodename, % the Node responsible for this chstate
     vclock,   % for this chstate object, entries are {Node, Ctr}
     chring,   % chash ring of {IndexAsInt, Node} mappings
+    nodemeta, % XXX: dict of node-specific metadata          
     meta      % dict of cluster-wide other data (primarily bucket N-value, etc)
 }). 
 -type riak_core_ring() :: #chstate{}.
@@ -74,9 +77,10 @@ fresh(NodeName) ->
 -spec fresh(RingSize :: integer(), NodeName :: term()) -> chstate().
 fresh(RingSize, NodeName) ->
     #chstate{nodename=NodeName,
-	    vclock=vclock:fresh(),
-	    chring=chash:fresh(RingSize, NodeName),
-            meta=dict:new()}.
+             vclock=vclock:fresh(),
+             chring=chash:fresh(RingSize, NodeName),
+             nodemeta=dict:new(),
+             meta=dict:new()}.
 
 % @doc Return all partition indices owned by the node executing this function.
 -spec my_indices(State :: chstate()) -> [integer()].
@@ -213,6 +217,7 @@ reconcile(ExternState, MyState) ->
             {new_ring, #chstate{nodename=MyState#chstate.nodename,
                                 vclock=ExternState#chstate.vclock,
                                 chring=ExternState#chstate.chring,
+                                nodemeta=ExternState#chstate.nodemeta,
                                 meta=ExternState#chstate.meta}};
         false ->
             case ancestors([ExternState, MyState]) of
@@ -224,6 +229,7 @@ reconcile(ExternState, MyState) ->
                              #chstate{nodename=MyState#chstate.nodename,
                                       vclock=ExternState#chstate.vclock,
                                       chring=ExternState#chstate.chring,
+                                      nodemeta=ExternState#chstate.nodemeta,
                                       meta=ExternState#chstate.meta}};
                         false -> {no_change, MyState}
                     end;
@@ -244,6 +250,10 @@ equal_rings(_A=#chstate{chring=RA,meta=MA},_B=#chstate{chring=RB,meta=MB}) ->
         false -> false;
         true -> RA =:= RB
     end.
+
+-spec membership_hash(chstate()) -> non_neg_integer().
+membership_hash(R=#chstate{}) ->
+    erlang:phash2(all_owners(R)).
 
 % @doc If two states are mutually non-descendant, merge them anyway.
 %      This can cause a bit of churn, but should converge.
@@ -270,6 +280,39 @@ pick_val(M1,M2) ->
     case M1#meta_entry.lastmod > M2#meta_entry.lastmod of
         true -> M1;
         false -> M2
+    end.
+
+% @doc Return a value from the cluster metadata dict
+-spec get_node_meta(State :: chstate()) -> list().
+
+get_node_meta(State) -> 
+    case dict:find(node(), State#chstate.nodemeta) of
+        error -> [];
+        {ok, M} -> {ok, M#meta_entry.value}
+    end.
+
+                
+% @doc Set a key in the cluster metadata dict
+-spec update_node_meta(list(), State :: chstate()) -> chstate().
+update_node_meta(Val, State) ->
+    Change = case dict:find(node(), State#chstate.nodemeta) of
+                 {ok, OldM} ->
+                     Val /= OldM#meta_entry.value;
+                 error ->
+                     true
+             end,
+    if Change ->
+            M = #meta_entry { 
+              lastmod = calendar:datetime_to_gregorian_seconds(
+                          calendar:universal_time()),
+              value = Val
+             },
+            VClock = vclock:increment(State#chstate.nodename,
+                                      State#chstate.vclock),
+            State#chstate{vclock=VClock,
+                          meta=dict:store(node(), M, State#chstate.nodemeta)};
+       true ->
+            State
     end.
     
 

@@ -85,37 +85,45 @@ handle_call(_, _From, State) ->
     {reply, ok, State}.
 
 
-%% @private
-handle_cast({send_ring_to, Node}, RingChanged) ->
-    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
-    gen_server:cast({?MODULE, Node}, {reconcile_ring, MyRing}),
-    {noreply, RingChanged};
+diff_rings(R1,R2) ->
+    [{I,N1,N2} || {{I,N1},{I,N2}} <- lists:zip(riak_core_ring:all_owners(R1),
+                                               riak_core_ring:all_owners(R2)),
+                  N1 /= N2].
+    
+get_transfers(R1, R2) ->
+    diff_rings(R1, R2).
 
-handle_cast({distribute_ring, Ring}, RingChanged) ->
+
+%% @private
+handle_cast({send_ring_to, Node}, true) ->
+    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
+    handle_cast({send_ring_to, Node}, MyRing);
+handle_cast({send_ring_to, Node}, GoalRing) ->
+    gen_server:cast({?MODULE, Node}, {reconcile_ring, GoalRing}),
+    {noreply, GoalRing};
+
+handle_cast({distribute_ring, Ring}, GoalRing) ->
     Nodes = riak_core_ring:all_members(Ring),
     gen_server:abcast(Nodes, ?MODULE, {reconcile_ring, Ring}),
-    {noreply, RingChanged};
+    {noreply, GoalRing};
 
-handle_cast({reconcile_ring, OtherRing}, RingChanged) ->
+handle_cast({reconcile_ring, OtherRing}, true) ->
+    {ok, R} = riak_core_ring_manager:get_my_ring(),
+    handle_cast({reconcile_ring, OtherRing}, R);
+handle_cast({reconcile_ring, OtherRing}, GoalRing) ->
     % Compare the two rings, see if there is anything that
     % must be done to make them equal...
-    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
-    case riak_core_ring:reconcile(OtherRing, MyRing) of
-        {no_change, _} ->
-            {noreply, RingChanged};
-
-        {new_ring, ReconciledRing} ->
-            % Rebalance the new ring and save it
-            BalancedRing = claim_until_balanced(ReconciledRing),
-            riak_core_ring_manager:set_my_ring(BalancedRing),
-
-            % Finally, push it out to another node - expect at least two nodes now
-            RandomNode = riak_core_ring:random_other_node(BalancedRing),
-            send_ring(node(), RandomNode),
-            {noreply, true}
+    {OldHash, MyRing} = riak_core_ring_manager:get_ring_info(),
+    case (riak_core_ring:membership_hash(OtherRing) =:= 
+              riak_core_ring:membership_hash(GoalRing)) of
+        true ->
+            {noreply, GoalRing};
+        false ->
+            reconcile2(OldHash, MyRing, OtherRing, GoalRing)
     end;
 
-handle_cast(gossip_ring, _RingChanged) ->
+
+handle_cast(gossip_ring, GoalRing) ->
     % First, schedule the next round of gossip...
     schedule_next_gossip(),
 
@@ -127,7 +135,7 @@ handle_cast(gossip_ring, _RingChanged) ->
         RandomNode ->
             send_ring(node(), RandomNode)
     end,
-    {noreply, false};
+    {noreply, GoalRing};
 
 handle_cast(_, State) ->
     {noreply, State}.
@@ -249,3 +257,31 @@ attempt_simple_transfer(Ring, [{_, N}|Rest], TargetN, Exit, Idx, Last) ->
                             lists:keyreplace(N, 1, Last, {N, Idx}));
 attempt_simple_transfer(Ring, [], _, _, _, _) ->
     {ok, Ring}.
+
+reconcile2(OldHash, MyRing, OtherRing, GoalRing) ->
+    case riak_core_ring:reconcile(OtherRing, MyRing) of
+        {no_change, _} ->
+            {noreply, GoalRing};
+        {new_ring, ReconciledRing} ->
+            BalancedRing = claim_until_balanced(ReconciledRing),
+            case length(riak_core_ring:all_members(OtherRing)) =:= 1 of
+                true ->
+                    io:format("length = 1, ~p~n", [riak_core_ring:owner_node(OtherRing)]),
+                    Transfers = get_transfers(OtherRing, BalancedRing);
+                false ->
+                    io:format("length > 1, ~p~n", [riak_core_ring:owner_node(OtherRing)]),
+                    Transfers = get_transfers(MyRing,BalancedRing)
+            end,
+            io:format("diff rings: ~p~n", [Transfers]),
+            NewHash = riak_core_ring:membership_hash(BalancedRing),
+            case riak_core_handoff_manager:install_view(OldHash, NewHash, Transfers, BalancedRing) of
+                ignore ->
+                    {noreply, BalancedRing};
+                _ ->
+                    %%riak_core_ring_manager:set_my_ring(BalancedRing),
+                    % Finally, push it out to another node - expect at least two nodes now
+                    RandomNode = riak_core_ring:random_other_node(BalancedRing),
+                    send_ring(node(), RandomNode),
+                    {noreply, BalancedRing}
+            end
+    end.

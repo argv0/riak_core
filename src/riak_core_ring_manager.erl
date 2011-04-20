@@ -30,6 +30,7 @@
 -export([start_link/0,
          start_link/1,
          get_my_ring/0,
+         get_ring_info/0,
          refresh_my_ring/0,
          set_my_ring/1,
          write_ringfile/0,
@@ -64,9 +65,15 @@ start_link(test) ->
 %% @spec get_my_ring() -> {ok, riak_core_ring:riak_core_ring()} | {error, Reason}
 get_my_ring() ->
     case mochiglobal:get(?RING_KEY) of
-        Ring when is_tuple(Ring) -> {ok, Ring};
+        {_Hash, Ring} when is_tuple(Ring) -> {ok, Ring};
         undefined -> {error, no_ring}
     end.
+
+get_ring_info() ->
+    case mochiglobal:get(?RING_KEY) of
+        {Hash, Ring} when is_tuple(Ring) -> {Hash, Ring};
+        undefined -> {error, no_ring}
+    end.    
 
 %% @spec refresh_my_ring() -> ok
 refresh_my_ring() ->
@@ -267,7 +274,8 @@ back(N,X,[H|T]) ->
 %% to make test setup simpler - no need to spin up a riak_core_ring_manager
 %% process.
 set_ring_global(Ring) ->
-    mochiglobal:put(?RING_KEY, Ring).
+    %% XXXX
+    mochiglobal:put(?RING_KEY, {riak_core_ring:membership_hash(Ring), Ring}).
 
 %% Persist a new ring file, set the global value and notify any listeners
 prune_write_notify_ring(Ring) ->

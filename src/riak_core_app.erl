@@ -82,6 +82,7 @@ start(_StartType, _StartArgs) ->
                                            [Reason]),
                     throw({error, Reason})
             end,
+            riak_core_node_watcher:service_up(riak_core, Pid),
             {ok, Pid};
         {error, Reason} ->
             {error, Reason}

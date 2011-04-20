@@ -232,6 +232,7 @@ handle_info({'EXIT', Pid, Reason}, StateName, State=#state{mod=Mod,modstate=ModS
             {stop, linked_process_crash, State}
     end;
 
+
 handle_info(_Info, StateName, State) ->
     {next_state, StateName, State, State#state.inactivity_timeout}.
 
