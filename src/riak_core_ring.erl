@@ -37,7 +37,7 @@
          all_preflists/2,
          get_meta/2, update_meta/3, equal_rings/2,
          get_node_meta/1, update_node_meta/2,
-         membership_hash/1]).	 
+         membership_hash/1, vclock/1, merge_vclock/2, random_other_node2/1, all_members2/1]).	 
 
 -export_type([riak_core_ring/0]).
 
@@ -82,6 +82,11 @@ fresh(RingSize, NodeName) ->
              nodemeta=dict:new(),
              meta=dict:new()}.
 
+vclock(#chstate{vclock=VClock}) -> VClock.
+
+merge_vclock(State, OtherState) ->
+    State#chstate{vclock=vclock:merge([State#chstate.vclock, OtherState#chstate.vclock])}.
+
 % @doc Return all partition indices owned by the node executing this function.
 -spec my_indices(State :: chstate()) -> [integer()].
 my_indices(State) ->
@@ -122,6 +127,9 @@ owner_node(State) ->
 all_members(State) ->
     chash:members(State#chstate.chring).
 
+all_members2(#chstate{vclock=VClock}) ->
+    vclock:all_nodes(VClock).
+
 % @doc Return a randomly-chosen node from amongst the owners.
 -spec random_node(State :: chstate()) -> Node :: term().
 random_node(State) ->
@@ -132,6 +140,19 @@ random_node(State) ->
 -spec random_other_node(State :: chstate()) -> Node :: term() | no_node.
 random_other_node(State) ->
     case lists:delete(node(), all_members(State)) of
+        [] ->
+            no_node;
+        L ->
+            lists:nth(random:uniform(length(L)), L)
+    end.
+
+% @doc Return a randomly-chosen node from amongst the owners other than this one.
+-spec random_other_node2(State :: chstate()) -> Node :: term() | no_node.
+random_other_node2(State) ->
+    case lists:delete(node(), 
+                      ordsets:to_list(ordsets:intersection(
+                        nodes(),
+                        ordsets:from_list(all_members2(State))))) of
         [] ->
             no_node;
         L ->
@@ -215,7 +236,8 @@ reconcile(ExternState, MyState) ->
     case vclock:equal(MyState#chstate.vclock, vclock:fresh()) of
         true -> 
             {new_ring, #chstate{nodename=MyState#chstate.nodename,
-                                vclock=ExternState#chstate.vclock,
+                                vclock=vclock:increment(MyState#chstate.nodename,
+                                                        ExternState#chstate.vclock),
                                 chring=ExternState#chstate.chring,
                                 nodemeta=ExternState#chstate.nodemeta,
                                 meta=ExternState#chstate.meta}};
@@ -252,8 +274,13 @@ equal_rings(_A=#chstate{chring=RA,meta=MA},_B=#chstate{chring=RB,meta=MB}) ->
     end.
 
 -spec membership_hash(chstate()) -> non_neg_integer().
-membership_hash(R=#chstate{}) ->
-    erlang:phash2(all_owners(R)).
+membership_hash(R=#chstate{nodename=Node, vclock=VClock}) ->
+    case {all_members(R), VClock} of
+        {[Node], []} ->
+            0;
+        _ ->
+            erlang:phash2(all_owners(R))
+    end.
 
 % @doc If two states are mutually non-descendant, merge them anyway.
 %      This can cause a bit of churn, but should converge.

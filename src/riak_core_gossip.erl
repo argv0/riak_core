@@ -36,7 +36,7 @@
 -export([start_link/0, stop/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
--export ([distribute_ring/1, send_ring/1, send_ring/2, remove_from_cluster/1]).
+-export ([distribute_ring/1, send_ring/1, send_ring/2, send_ring/3, remove_from_cluster/1]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -63,6 +63,10 @@ send_ring(Node, Node) ->
 send_ring(FromNode, ToNode) ->
     gen_server:cast({?MODULE, FromNode}, {send_ring_to, ToNode}).
 
+send_ring(FromNode, ToNode, Ring) ->
+    gen_server:cast({?MODULE, FromNode}, {send_ring_to, ToNode, Ring}).
+
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -76,8 +80,9 @@ stop() ->
 
 %% @private
 init(_State) ->
-    schedule_next_gossip(),
-    {ok, true}.
+    {ok, R} = riak_core_ring_manager:get_my_ring(),
+    riak_core_ring_manager:set_ring_view(R),
+    {ok, {riak_core_ring:membership_hash(R), R}}.
 
 
 %% @private
@@ -95,47 +100,33 @@ get_transfers(R1, R2) ->
 
 
 %% @private
-handle_cast({send_ring_to, Node}, true) ->
-    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
-    handle_cast({send_ring_to, Node}, MyRing);
-handle_cast({send_ring_to, Node}, GoalRing) ->
-    gen_server:cast({?MODULE, Node}, {reconcile_ring, GoalRing}),
-    {noreply, GoalRing};
+handle_cast({send_ring_to, Node}, {H, R}) ->
+    gen_server:cast({?MODULE, Node}, {reconcile_ring, R}),
+    {noreply, {H, R}};
+handle_cast({send_ring_to, Node, Ring}, {H, R}) ->
+    gen_server:cast({?MODULE, Node}, {reconcile_ring, Ring}),
+    {noreply, {H, R}};
 
-handle_cast({distribute_ring, Ring}, GoalRing) ->
+handle_cast({distribute_ring, Ring}, {H, R}) ->
     Nodes = riak_core_ring:all_members(Ring),
     gen_server:abcast(Nodes, ?MODULE, {reconcile_ring, Ring}),
-    {noreply, GoalRing};
+    {noreply, {H, R}};
+handle_cast({reconcile_ring, OtherRing}, {H, R}) ->
+    reconcile2(OtherRing, {H, R});
 
-handle_cast({reconcile_ring, OtherRing}, true) ->
-    {ok, R} = riak_core_ring_manager:get_my_ring(),
-    handle_cast({reconcile_ring, OtherRing}, R);
-handle_cast({reconcile_ring, OtherRing}, GoalRing) ->
-    % Compare the two rings, see if there is anything that
-    % must be done to make them equal...
-    {OldHash, MyRing} = riak_core_ring_manager:get_ring_info(),
-    case (riak_core_ring:membership_hash(OtherRing) =:= 
-              riak_core_ring:membership_hash(GoalRing)) of
-        true ->
-            {noreply, GoalRing};
-        false ->
-            reconcile2(OldHash, MyRing, OtherRing, GoalRing)
-    end;
-
-
-handle_cast(gossip_ring, GoalRing) ->
+handle_cast(gossip_ring, {H, R}) ->
     % First, schedule the next round of gossip...
     schedule_next_gossip(),
 
     % Gossip the ring to some random other node...
-    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
-    case riak_core_ring:random_other_node(MyRing) of
+    %{ok, MyRing} = riak_core_ring_manager:get_my_ring(),
+    case riak_core_ring:random_other_node2(R) of
         no_node -> % must be single node cluster
             ok;
         RandomNode ->
             send_ring(node(), RandomNode)
     end,
-    {noreply, GoalRing};
+    {noreply, {H, R}};
 
 handle_cast(_, State) ->
     {noreply, State}.
@@ -206,8 +197,8 @@ remove_from_cluster(ExitingNode) ->
         end,
 
     % Send the new ring to all nodes except the exiting node
-    distribute_ring(ExitRing),
-
+    %distribute_ring(ExitRing),
+    reconcile2(ExitRing, {riak_core_ring:membership_hash(Ring), Ring}),
     % Set the new ring on the exiting node. This will trigger
     % it to begin handoff and cleanly leave the cluster.
     rpc:call(ExitingNode, riak_core_ring_manager, set_my_ring, [ExitRing]).
@@ -258,30 +249,56 @@ attempt_simple_transfer(Ring, [{_, N}|Rest], TargetN, Exit, Idx, Last) ->
 attempt_simple_transfer(Ring, [], _, _, _, _) ->
     {ok, Ring}.
 
-reconcile2(OldHash, MyRing, OtherRing, GoalRing) ->
-    case riak_core_ring:reconcile(OtherRing, MyRing) of
-        {no_change, _} ->
-            {noreply, GoalRing};
-        {new_ring, ReconciledRing} ->
-            BalancedRing = claim_until_balanced(ReconciledRing),
-            case length(riak_core_ring:all_members(OtherRing)) =:= 1 of
+reconcile2(OtherRing,{0,R}) ->
+    reconcile3(OtherRing, {0,R});
+reconcile2(OtherRing,{H,R}) ->
+    %io:format("my ring: ~p~n", [R]),
+    %io:format("other ring: ~p~n", [OtherRing]),
+    case riak_core_ring:membership_hash(OtherRing) =:= H of
+        true ->
+            OurVClock = riak_core_ring:vclock(R),
+            TheirVClock = riak_core_ring:vclock(OtherRing),
+            case vclock:equal(OurVClock, TheirVClock) of
                 true ->
-                    io:format("length = 1, ~p~n", [riak_core_ring:owner_node(OtherRing)]),
-                    Transfers = get_transfers(OtherRing, BalancedRing);
+                    io:format("ignored for same hash and vclock~n"),
+                    {noreply, {H, R}};
                 false ->
-                    io:format("length > 1, ~p~n", [riak_core_ring:owner_node(OtherRing)]),
-                    Transfers = get_transfers(MyRing,BalancedRing)
+                    reconcile3(OtherRing,{H,R})
+            end;
+        false ->
+            reconcile3(OtherRing,{H,R})
+    end.
+reconcile3(OtherRing, {H, R}) ->
+    io:format("~p : ~p~n", [H, riak_core_ring:membership_hash(OtherRing)]),
+    case riak_core_ring:reconcile(OtherRing, R) of
+        {no_change, _} ->
+            {noreply, {H, R}};
+        {new_ring, ReconciledRing} ->
+            %io:format("reconciled ring: ~p~n", [ReconciledRing]),
+            BalancedRing = claim_until_balanced(ReconciledRing),
+            io:format("balanced ring: ~p~n", [BalancedRing]),
+            Me = node(),
+            case {riak_core_ring:membership_hash(R), 
+                  vclock:all_nodes(riak_core_ring:vclock(BalancedRing))} of
+                {0, [Me]} ->
+                    Transfers = [];
+                _ ->
+                    Transfers = get_transfers(R, BalancedRing)
             end,
             io:format("diff rings: ~p~n", [Transfers]),
             NewHash = riak_core_ring:membership_hash(BalancedRing),
-            case riak_core_handoff_manager:install_view(OldHash, NewHash, Transfers, BalancedRing) of
-                ignore ->
-                    {noreply, BalancedRing};
+            case riak_core_handoff_manager:install_view(H, NewHash, Transfers, BalancedRing) of
+                ignored ->
+                    io:format("existing view ~p ignored~n", [{H, NewHash}]),
+                    {noreply, {NewHash, BalancedRing}};
                 _ ->
-                    %%riak_core_ring_manager:set_my_ring(BalancedRing),
+                    {ok, CurrentRing} = riak_core_ring_manager:get_my_ring(),
+                    NewMainRing = riak_core_ring:merge_vclock(CurrentRing, BalancedRing),
+                    riak_core_ring_manager:set_ring_view(BalancedRing),
+                    riak_core_ring_manager:set_my_ring(NewMainRing),
                     % Finally, push it out to another node - expect at least two nodes now
                     RandomNode = riak_core_ring:random_other_node(BalancedRing),
                     send_ring(node(), RandomNode),
-                    {noreply, BalancedRing}
+                    {noreply, {NewHash, BalancedRing}}
             end
     end.

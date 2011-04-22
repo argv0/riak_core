@@ -31,8 +31,10 @@
          start_link/1,
          get_my_ring/0,
          get_ring_info/0,
+         get_ring_info/1,
          refresh_my_ring/0,
          set_my_ring/1,
+         set_ring_view/1,
          write_ringfile/0,
          prune_ringfiles/0,
          read_ringfile/1,
@@ -75,6 +77,13 @@ get_ring_info() ->
         undefined -> {error, no_ring}
     end.    
 
+get_ring_info(MHash) ->
+    case mochiglobal:get(list_to_atom(atom_to_list(?RING_KEY) ++ 
+                                          "_" ++ integer_to_list(MHash))) of
+        {Hash, Ring} when is_tuple(Ring) -> {Hash, Ring};
+        undefined -> {error, no_ring}
+    end.    
+
 %% @spec refresh_my_ring() -> ok
 refresh_my_ring() ->
     gen_server2:call(?MODULE, refresh_my_ring, infinity).
@@ -82,6 +91,10 @@ refresh_my_ring() ->
 %% @spec set_my_ring(riak_core_ring:riak_core_ring()) -> ok
 set_my_ring(Ring) ->
     gen_server2:call(?MODULE, {set_my_ring, Ring}, infinity).
+
+%% @spec set_my_ring(riak_core_ring:riak_core_ring()) -> ok
+set_ring_view(Ring) ->
+    gen_server2:call(?MODULE, {set_ring_view, Ring}, infinity).
 
 
 %% @spec write_ringfile() -> ok
@@ -181,7 +194,7 @@ stop() ->
 init([Mode]) ->
     case Mode of
         live ->
-            Ring = riak_core_ring:fresh();
+            {ok, Ring} = get_my_ring();
         test ->
             Ring = riak_core_ring:fresh(16,node())
     end,
@@ -198,6 +211,9 @@ init([Mode]) ->
 
 handle_call({set_my_ring, Ring}, _From, State) ->
     prune_write_notify_ring(Ring),
+    {reply,ok,State};
+handle_call({set_ring_view, Ring}, _From, State) ->
+    prune_write_notify_ring_view(Ring),
     {reply,ok,State};
 handle_call(refresh_my_ring, _From, State) ->
     %% This node is leaving the cluster so create a fresh ring file
@@ -216,11 +232,13 @@ handle_call({ring_trans, Fun, Args}, _From, State) ->
     case catch Fun(Ring, Args) of
         {new_ring, NewRing} ->
             prune_write_notify_ring(NewRing),
-            case riak_core_ring:random_other_node(NewRing) of
+            case riak_core_ring:random_other_node2(NewRing) of
                 no_node ->
+                    io:format("can't gossip after ring_trans!~n"),
                     ignore;
                 Node ->
-                    riak_core_gossip:send_ring(Node)
+                    io:format("ring_trans: gossiping to ~p~n", [Node]),
+                    riak_core_gossip:send_ring(node(), Node, NewRing)
             end,
             {reply, {ok, NewRing}, State};
         ignore ->
@@ -273,14 +291,29 @@ back(N,X,[H|T]) ->
 %% Set the ring in mochiglobal.  Exported during unit testing
 %% to make test setup simpler - no need to spin up a riak_core_ring_manager
 %% process.
+
+set_ring_view_global(Ring) ->
+    MHash = riak_core_ring:membership_hash(Ring),
+    Key = list_to_atom(atom_to_list(?RING_KEY) ++ "_" ++ integer_to_list(MHash)),
+    mochiglobal:put(Key, {MHash, Ring}).
+
 set_ring_global(Ring) ->
     %% XXXX
     mochiglobal:put(?RING_KEY, {riak_core_ring:membership_hash(Ring), Ring}).
 
 %% Persist a new ring file, set the global value and notify any listeners
+prune_write_notify_ring_view(Ring) ->
+    %riak_core_ring_manager:prune_ringfiles(),
+    %do_write_ringfile(Ring),
+    set_ring_view_global(Ring).
+    %%riak_core_ring_events:ring_update(Ring).
+
+
+%% Persist a new ring file, set the global value and notify any listeners
 prune_write_notify_ring(Ring) ->
     riak_core_ring_manager:prune_ringfiles(),
     do_write_ringfile(Ring),
+    set_ring_view_global(Ring),
     set_ring_global(Ring),
     riak_core_ring_events:ring_update(Ring).
 

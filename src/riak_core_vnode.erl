@@ -33,7 +33,7 @@
          terminate/3, 
          code_change/4]).
 -export([reply/2]).
--export([get_mod_index/1]).
+-export([get_mod_index/1, handoff_to/2]).
 
 -spec behaviour_info(atom()) -> 'undefined' | [{atom(), arity()}].
 behaviour_info(callbacks) ->
@@ -88,6 +88,9 @@ start_link(Mod, Index, InitialInactivityTimeout) ->
 %% typically to do some deferred processing after returning yourself
 send_command(Pid, Request) ->
     gen_fsm:send_event(Pid, ?VNODE_REQ{request=Request}).
+
+handoff_to(Pid, ToNode) ->
+    gen_fsm:send_event(Pid, {handoff_to, ToNode}).
 
 
 %% Sends a command to the FSM that called it after Time 
@@ -147,18 +150,26 @@ vnode_handoff_command(Sender, Request, State=#state{index=Index,
             {stop, Reason, State#state{modstate=NewModState}}
     end.
 
-active(timeout, State=#state{mod=Mod, modstate=ModState}) ->
-    case should_handoff(State) of
-        {true, TargetNode} ->
-            case Mod:handoff_starting(TargetNode, ModState) of
-                {true, NewModState} ->
-                    start_handoff(State#state{modstate=NewModState}, TargetNode);
-                {false, NewModState} ->
-                    continue(State, NewModState)
-            end;
-        false ->
-            continue(State)
+active({handoff_to, TargetNode}, State=#state{mod=Mod, modstate=ModState}) ->
+    case Mod:handoff_starting(TargetNode, ModState) of
+        {true, NewModState} ->
+            start_handoff(State#state{modstate=NewModState}, TargetNode);
+        {false, NewModState} ->
+            continue(State, NewModState)
     end;
+active(timeout, State=#state{mod=_Mod, modstate=_ModState}) ->
+    continue(State);
+%    case should_handoff(State) of
+%        {true, TargetNode} ->
+%            case Mod:handoff_starting(TargetNode, ModState) of
+%                {true, NewModState} ->
+%                    start_handoff(State#state{modstate=NewModState}, TargetNode);
+%                {false, NewModState} ->
+%                    continue(State, NewModState)
+%            end;
+%        false ->
+%            continue(State)
+%    end;
 active(?VNODE_REQ{sender=Sender, request=Request},
        State=#state{handoff_node=HN}) when HN =:= none ->
     vnode_command(Sender, Request, State);
@@ -171,20 +182,25 @@ active(handoff_complete, State=#state{mod=Mod,
                                       handoff_token=HT}) ->
     riak_core_handoff_manager:release_handoff_lock({Mod, Idx}, HT),
     Mod:handoff_finished(HN, ModState),
+    riak_core_handoff_manager:handoff_completed(Mod, Idx, node(), HN),
     {ok, NewModState} = Mod:delete(ModState),
     riak_core_handoff_manager:add_exclusion(Mod, Idx),
     {stop, normal, State#state{modstate=NewModState, 
                                handoff_node=none, 
                                handoff_pid=undefined}};
+
+
+
 active({handoff_error, _Err, _Reason}, State=#state{mod=Mod, 
                                                     modstate=ModState,
                                                     index=Idx, 
                                                     handoff_token=HT}) ->
     riak_core_handoff_manager:release_handoff_lock({Mod, Idx}, HT),
     %% it would be nice to pass {Err, Reason} to the vnode but the 
-    %% API doesn't currently allow for that.
+    %% API doesn't currently allow for that
     Mod:handoff_cancelled(ModState),
-    continue(State#state{handoff_node=none}).
+    NewState = State#state{handoff_node=none},
+    continue(NewState).
 
 active(_Event, _From, State) ->
     Reply = ok,
@@ -229,6 +245,7 @@ handle_info({'EXIT', Pid, Reason}, StateName, State=#state{mod=Mod,modstate=ModS
         end
     catch
         _ErrorType:undef ->
+            io:format("bleh ~p~n", [erlang:get_stacktrace()]),
             {stop, linked_process_crash, State}
     end;
 
@@ -243,29 +260,35 @@ terminate(Reason, _StateName, #state{mod=Mod, modstate=ModState}) ->
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
 
-should_handoff(#state{index=Idx, mod=Mod}) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    Me = node(),
-    case riak_core_ring:index_owner(Ring, Idx) of
-        Me ->
-            false;
-        TargetNode ->
-            case app_for_vnode_module(Mod) of
-                undefined -> false;
-                {ok, App} ->
-                    case lists:member(TargetNode, 
-                                      riak_core_node_watcher:nodes(App)) of
-                        false  -> false;
-                        true -> {true, TargetNode}
-                    end
-            end
-    end.
+
+%should_handoff(#state{index=Idx, mod=Mod}) ->
+%    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+%    Me = node(),
+%    case riak_core_ring:index_owner(Ring, Idx) of
+%        Me ->
+%            false;
+%        TargetNode ->
+%            case app_for_vnode_module(Mod) of
+%                undefined -> false;
+%                {ok, _App} ->
+%                    case lists:member(TargetNode, riak_core_ring:all_members2(Ring)) of
+%%                                      riak_core_node_watcher:nodes(App)) of
+%                        false  -> false;
+%                        %true -> {true, TargetNode}
+%                        true -> 
+%                            io:format("~p: not handing off ~p to ~p even though should_handoff says i should~n", [Mod, Idx, TargetNode]),
+%                            false
+%                    end
+%            end
+%    end.
 
 start_handoff(State=#state{index=Idx, mod=Mod, modstate=ModState}, TargetNode) ->
     case Mod:is_empty(ModState) of
         {true, NewModState} ->
+            error_logger:info_msg("Handoff of empty partition ~p to ~p cancelled~n", [Idx, TargetNode]),
             {ok, NewModState1} = Mod:delete(NewModState),
             riak_core_handoff_manager:add_exclusion(Mod, Idx),
+            riak_core_handoff_manager:handoff_completed(Mod, Idx, node(), TargetNode),
             {stop, normal, State#state{modstate=NewModState1}};
         {false, NewModState} ->  
             case riak_core_handoff_manager:get_handoff_lock({Mod, Idx}) of
@@ -303,14 +326,14 @@ reply({raw, Ref, From}, Reply) ->
 reply(ignore, _Reply) ->
     ok.
                    
-app_for_vnode_module(Mod) when is_atom(Mod) ->
-    case application:get_env(riak_core, vnode_modules) of
-        {ok, Mods} ->
-            case lists:keysearch(Mod, 2, Mods) of
-                {value, {App, Mod}} ->
-                    {ok, App};
-                false ->
-                    undefined
-            end;
-        undefined -> undefined
-    end.
+%app_for_vnode_module(Mod) when is_atom(Mod) ->
+%    case application:get_env(riak_core, vnode_modules) of
+%        {ok, Mods} ->
+%            case lists:keysearch(Mod, 2, Mods) of
+%                {value, {App, Mod}} ->
+%                    {ok, App};
+%                false ->
+%                    undefined
+%            end;
+%        undefined -> undefined
+%    end.

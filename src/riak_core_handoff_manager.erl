@@ -21,7 +21,7 @@
 -export([add_exclusion/2, get_handoff_lock/1, get_exclusions/1]).
 -export([remove_exclusion/2]).
 -export([release_handoff_lock/2]).
--export([install_view/4]).
+-export([install_view/4, handoff_completed/4]).
 -export([test/0]).
 
 -record(state, {status = up,
@@ -52,6 +52,10 @@ start_link() ->
 install_view(OldHash, NewHash, Transfers, NewRing) ->
     gen_server:call(?MODULE, {install_view, OldHash, NewHash, Transfers, NewRing}).
 
+handoff_completed(Mod, Idx, From, To) ->
+    gen_server:cast(?MODULE, {handoff_completed, Mod, Idx, From, To}).
+
+
 init([]) ->
     process_flag(trap_exit, true),
     watch_for_ring_events(),
@@ -69,7 +73,7 @@ get_exclusions(Module) ->
     gen_server:call(?MODULE, {get_exclusions, Module}, infinity).
 
 get_handoff_lock(LockId) ->
-    TokenCount = app_helper:get_env(riak_core, handoff_concurrency, 4),
+    TokenCount = app_helper:get_env(riak_core, handoff_concurrency, 500),
     get_handoff_lock(LockId, TokenCount).
 
 get_handoff_lock(_LockId, 0) ->
@@ -99,6 +103,14 @@ handle_call({install_view, OldHash, NewHash, Transfers, _NewRing}, _From, State)
             {reply, ok, NewState}
     end.
 
+handle_cast({handoff_completed, _Mod, Index, FromNode, ToNode}, State) ->
+    io:format("completed: ~p~n", [{Index,FromNode,ToNode}]),
+    io:format("views: ~p~n", [State#state.views]),
+    F = fun(Ring, {Idx, To}) ->
+                {new_ring, riak_core_ring:transfer_node(Idx, To, Ring)}
+        end,
+    {ok, _NewRing} = riak_core_ring_manager:ring_trans(F, {Index, ToNode}),
+    {noreply, State};
 handle_cast({del_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
     {noreply, State#state{excl=ordsets:del_element({Mod, Idx}, Excl)}};
 handle_cast({add_exclusion, {Mod, Idx}}, State=#state{excl=Excl}) ->
@@ -109,16 +121,17 @@ handle_cast({ring_update, _R}, State) ->
     %% Ring has changed; determine what peers are new to us
     %% and broadcast out current status to those peers.
     {Hash, _} = riak_core_ring_manager:get_ring_info(),
-    io:format("~p: ring_update.  hash=~p~n", [?MODULE, Hash]),
+    io:format("~p: ring_update.  current view: ~p~n",
+              [?MODULE, {Hash, riak_core_ring:membership_hash(_R), State#state.ring_hash}]),
     %%Peers0 = ordsets:from_list(riak_core_ring:all_members(R)),
     %%Peers = ordsets:del_element(node(), Peers0),
     %%S2 = peers_update(Peers, State),
-    {noreply, State#state{ring_hash=Hash}};
+    {noreply, State};
 handle_cast({node_update, _N}, State) ->
     %% Ring has changed; determine what peers are new to us
     %% and broadcast out current status to those peers.
     {Hash, _} = riak_core_ring_manager:get_ring_info(),
-    io:format("~p: ring_update.  hash=~p~n", [?MODULE, Hash]),
+    io:format("~p: node_update.  hash=~p~n", [?MODULE, Hash]),
     %_Peers0 = ordsets:from_list(riak_core_ring:all_members(R)),
     %_Peers = ordsets:del_element(node(), Peers0),
     %%S2 = peers_update(Peers, State),
@@ -126,20 +139,13 @@ handle_cast({node_update, _N}, State) ->
 handle_cast({down, Node}, State) ->
     io:format("~p: node ~p is down~n", [?MODULE, Node]),
     {noreply, State};
-handle_cast({state, Node, RingHash, Views, GlobalXfers, PendingXfers}, State) ->
+handle_cast({state, Node, RingHash, Views, _GlobalXfers, _PendingXfers}, State) ->
     io:format("~n~n~p: node: ~p~n", [?MODULE, Node]),
     io:format("~p: ringhash: ~p~n", [?MODULE, RingHash]),
-    io:format("~p: globalxfers: ~p~n", [?MODULE, GlobalXfers]),
-    io:format("~p: pendingxfers: ~p~n", [?MODULE, PendingXfers]),
-    NewViews = case proplists:get_value(Node, State#state.peer_views) of
-                   undefined ->
-            [{Node, Views}|State#state.peer_views];
-        ExistingViews ->
-            [{Node, ordsets:to_list(ordsets:from_list(lists:append(ExistingViews, Views)))}|
-             proplists:delete(Node, State#state.peer_views)]
-    end,
-    io:format("~p: newviews: ~p~n", [?MODULE, NewViews]),
-    NewState = State#state{peer_views=NewViews},
+    %io:format("~p: globalxfers: ~p~n", [?MODULE, GlobalXfers]),
+    %io:format("~p: pendingxfers: ~p~n", [?MODULE, PendingXfers]),
+    NewState = update_peer_views(Node, RingHash, Views, State),
+    io:format("~p: view: ~p, ~p~n", [?MODULE, Node, NewState#state.peer_views]),
     {noreply, NewState}.
 
 handle_info({gen_event_EXIT, H, _}, State) ->
@@ -161,7 +167,25 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+update_peer_views(Node, _RingHash, Views, State) ->
+    %Old = ordsets:from_list(proplists:get_value(Node, State#state.peer_views, [])),
+    New = ordsets:from_list(Views),
+    %Added = ordsets:subtract(New, Old),
+    %Deleted = ordsets:subtract(Old, New),
+    %Unchanged = ordsets:intersection(New, Old),
+    %io:format("New: ~p~n", [New]),
+    %io:format("Added: ~p~n", [Added]),
+    %io:format("Deleted: ~p~n", [Deleted]),
+    %io:format("Unchanged: ~p~n", [Unchanged]),
+    State#state{peer_views=[{Node, New}|proplists:delete(Node, State#state.peer_views)]}.
 
+
+handle_install_view(0,0,_,_,_) ->
+    ignore;
+handle_install_view(OldHash,NewHash,_,NewRing,State) when OldHash =:= NewHash ->
+    io:format("INSTALL VIEW CHANGING RING: ~p:~p~n", [OldHash,NewHash]),
+    {ok, NewRing} = riak_core_ring_manager:ring_trans(fun(_, _) -> {new_ring, NewRing} end, []),
+    {new_view, State#state{ring=NewRing, ring_hash=NewHash}};
 handle_install_view(OldHash, NewHash, Transfers, _NewRing, State) ->
     View = {OldHash, NewHash},
     case proplists:get_value(View, State#state.views) of
@@ -171,20 +195,38 @@ handle_install_view(OldHash, NewHash, Transfers, _NewRing, State) ->
                          || {Index, FromNode, ToNode} <- Transfers],
             
             case [{I#pxfer.index, I#pxfer.from_node, I#pxfer.to_node} 
-                  || I <- ViewXfers, I#pxfer.from_node =:= node()] of
+                  || I <- ViewXfers] of
+                         %%, I#pxfer.from_node =:= node()] of
                 [] ->
+                    io:format("no transfers~n"),
                     ignore;
-                [{Idx, From, To}|_Rest] ->
-                    NewRing = riak_core_ring:transfer_node(Idx, To, State#state.ring),
-                    riak_core_ring_manager:set_my_ring(NewRing),
-                    R = gen_server:cast({riak_core_gossip, From},{reconcile_ring, NewRing}),
-                    io:format("rpc result: ~p~n", [R])
+                [{_Idx, _From, _To}|_Rest]=T ->
+                    io:format("transfers: ~p~n", [T]),
+                    do_transfers(T),
+                    %NewRing = riak_core_ring:transfer_node(Idx, To, State#state.ring),
+                    %riak_core_ring_manager:set_my_ring(NewRing),
+                    %R = gen_server:cast({riak_core_gossip, From},{reconcile_ring, NewRing}),
+                    %io:format("rpc result: ~p~n", [R]),
+                    %R
+                    ok
             end,
-            {new_view, State#state{views=[{View, ViewXfers}|State#state.views]}};
+            {new_view, State#state{ring=_NewRing, ring_hash=NewHash, 
+                                   views=[{View, ViewXfers}|State#state.views]}};
         _ ->
             ignore
     end.
-            
+
+do_transfers([]) ->
+    ok;
+do_transfers([{Idx,From,To}|Rest]) when From =:= node() ->
+    {ok, Pid} = riak_core_vnode_master:get_vnode_pid(Idx, riak_kv_vnode),
+    riak_core_vnode:handoff_to(Pid, To),
+    do_transfers(Rest);
+do_transfers([{Idx,From,To}|Rest]) ->
+    io:format("ignoring not-mine xfer: ~p,~p,~p~n", [Idx, From, To]),
+    do_transfers(Rest).
+    
+          
 watch_for_ring_events() ->
     Self = self(),
     Fn = fun(R) ->

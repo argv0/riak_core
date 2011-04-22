@@ -65,27 +65,29 @@ start(_StartType, _StartArgs) ->
        {chash_keyfun, {riak_core_util, chash_std_keyfun}}]),
 
     %% Spin up the supervisor; prune ring files as necessary
+    riak_core_ring_manager:prune_ringfiles(),
+    Ring = case riak_core_ring_manager:find_latest_ringfile() of
+        {ok, RingFile} ->
+            riak_core_ring_manager:read_ringfile(RingFile);
+        {error, not_found} ->
+            error_logger:warning_msg("No ring file available.\n"),
+            Ring0 = riak_core_ring:fresh(),
+            riak_core_ring_manager:do_write_ringfile(Ring0),
+            Ring0;                   
+        {error, Reason1} ->
+            error_logger:error_msg("Failed to load ring file: ~p\n",
+                                   [Reason1]),
+            throw({error, Reason1})
+    end,
+    riak_core_ring_manager:set_ring_global(Ring),
     case riak_core_sup:start_link() of
         {ok, Pid} ->
             ok = riak_core_ring_events:add_guarded_handler(riak_core_ring_handler, []),
-            %% App is running; search for latest ring file and initialize with it
-            riak_core_ring_manager:prune_ringfiles(),
-            case riak_core_ring_manager:find_latest_ringfile() of
-                {ok, RingFile} ->
-                    Ring = riak_core_ring_manager:read_ringfile(RingFile),
-                    riak_core_ring_manager:set_my_ring(Ring);
-                {error, not_found} ->
-                    riak_core_ring_manager:write_ringfile(),
-                    error_logger:warning_msg("No ring file available.\n");
-                {error, Reason} ->
-                    error_logger:error_msg("Failed to load ring file: ~p\n",
-                                           [Reason]),
-                    throw({error, Reason})
-            end,
+            riak_core_ring_manager:set_my_ring(Ring),
             riak_core_node_watcher:service_up(riak_core, Pid),
             {ok, Pid};
-        {error, Reason} ->
-            {error, Reason}
+        {error, Reason2} ->
+            {error, Reason2}
     end.
 
 stop(_State) ->
